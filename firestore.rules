@@ -1,0 +1,150 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // -------------------------------------------------------------------------
+    // 0. GLOBAL SAFETY NET
+    // -------------------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. HELPERS
+    // -------------------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return request.auth.token.email_verified == true;
+    }
+
+    function existingData() {
+      return resource.data;
+    }
+
+    function incomingData() {
+      return request.resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Role lookups (using get() for authoritative source)
+    function getUserRole(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId))
+        ? get(/databases/$(database)/documents/users/$(userId)).data.get('role', 'staff')
+        : 'staff';
+    }
+
+    function isAdmin() {
+      return isSignedIn() && getUserRole(request.auth.uid) == 'admin';
+    }
+
+    function isStaff() {
+      return isSignedIn() && getUserRole(request.auth.uid) in ['admin', 'staff'];
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. USER PROFILES
+    // -------------------------------------------------------------------------
+    match /users/{userId} {
+      allow get: if isSignedIn() && request.auth.uid == userId;
+      allow list: if isAdmin();
+      
+      function isValidUser(data) {
+        return data.uid == request.auth.uid 
+          && data.email == request.auth.token.email
+          && data.role in ['admin', 'staff']
+          && data.role.size() <= 10
+          && data.keys().hasAll(['uid', 'email', 'role'])
+          && data.keys().size() >= 3;
+      }
+
+      // First user creation (bootstrapping admin) or via invite
+      allow create: if isSignedIn() && isEmailVerified() && isValidUser(incomingData()) && request.auth.uid == userId;
+      
+      // Admin can update roles, users can update their own profile
+      allow update: if isSignedIn() && isEmailVerified() && (
+        (request.auth.uid == userId && incomingData().diff(existingData()).affectedKeys().hasOnly(['phoneNumber', 'displayName', 'status', 'createdAt', 'role']))
+        || (isAdmin() && incomingData().diff(existingData()).affectedKeys().hasOnly(['role', 'status']))
+      ) && isValidUser(incomingData());
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. INVITE CODES
+    // -------------------------------------------------------------------------
+    match /invites/{code} {
+      allow get: if isSignedIn();
+      allow create: if isAdmin() && isEmailVerified();
+      allow update: if isSignedIn() && isEmailVerified() && incomingData().diff(existingData()).affectedKeys().hasOnly(['usedBy', 'status']);
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. WAREHOUSE ITEMS
+    // -------------------------------------------------------------------------
+    match /items/{itemId} {
+      allow read: if isSignedIn();
+      
+      function isValidItem(data) {
+        return data.name is string && data.name.size() > 0 && data.name.size() <= 200
+          && data.quantity is number && data.quantity >= 0
+          && data.keys().hasAll(['name', 'quantity'])
+          && data.keys().size() <= 15;
+      }
+
+      allow create: if (isAdmin() || (isStaff() && isEmailVerified())) && isValidItem(incomingData());
+      
+      allow update: if (isAdmin() || (isStaff() && isEmailVerified())) && isValidItem(incomingData()) && (
+        isAdmin() || incomingData().diff(existingData()).affectedKeys().hasOnly(['quantity', 'updatedAt', 'isBroken', 'lowStockThreshold'])
+      );
+      
+      allow delete: if isAdmin() && isEmailVerified();
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. INVENTORY LOGS
+    // -------------------------------------------------------------------------
+    match /logs/{logId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isEmailVerified(); // Any authenticated action creates a log
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. BROKEN RECORDS
+    // -------------------------------------------------------------------------
+    match /broken_records/{recordId} {
+      allow read: if isSignedIn();
+
+      function isValidBrokenRecord(data) {
+        return (data.get('itemId', '') is string)
+          && (data.get('itemName', '') is string)
+          && (data.get('quantity', 0) is number)
+          && (data.get('userId', '') is string)
+          && (data.get('status', 'broken') in ['broken', 'fixed', 'returned'])
+          && (!data.keys().hasAny(['timestamp']) || data.timestamp is timestamp)
+          && (!data.keys().hasAny(['reason']) || data.reason is string)
+          && (!data.keys().hasAny(['fixedDetails']) || data.fixedDetails is map);
+      }
+
+      allow create: if isSignedIn() && isEmailVerified()
+        && isValidBrokenRecord(incomingData())
+        && incomingData().userId == request.auth.uid
+        && incomingData().status == 'broken'
+        && incomingData().timestamp == request.time;
+
+      allow update: if isSignedIn() && isEmailVerified()
+        && isValidBrokenRecord(incomingData())
+        && (
+          isAdmin() || isStaff() || (
+            existingData().userId == request.auth.uid &&
+            existingData().status == 'broken'
+          )
+        )
+        && incomingData().userId == existingData().userId;
+
+      allow delete: if isAdmin() || (isSignedIn() && isEmailVerified() && existingData().userId == request.auth.uid && existingData().status == 'broken');
+    }
+  }
+}
